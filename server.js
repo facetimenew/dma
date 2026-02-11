@@ -50,10 +50,15 @@ app.use(helmet({
 }));
 app.use(express.json({ limit: '50mb' }));
 
-// Rate limiting
+// Rate limiting - FIXED for Render/Proxy environments
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100
+    max: 100,
+    // FIX: Disable the validation check for X-Forwarded-For header
+    validate: {
+        xForwardedForHeader: false,
+        trustProxy: false
+    }
 });
 app.use('/api/', apiLimiter);
 
