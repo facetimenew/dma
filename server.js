@@ -1683,8 +1683,3 @@ function shutdown() {
         });
     });
 }
-
-// ============================================
-// EXPORTS
-// ============================================
-module.exports = { app, server, wss, connectedDevices };
