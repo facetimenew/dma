@@ -51,15 +51,6 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter);
 
-// ============================================
-// CACHE & DATA STRUCTURES
-// ============================================
-const commandCache = new NodeCache({ stdTTL: 2 });
-const messageCache = new NodeCache({ stdTTL: 5 });
-let bot = null;
-const connectedDevices = new Map();
-const pendingCommands = new Map();
-const userSessions = new Map();
 
 // ============================================
 // DIRECTORY CREATION
