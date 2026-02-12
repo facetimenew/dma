@@ -25,8 +25,16 @@ if (!token || token.includes('AAHGZy_dy804ZwHoq48SnIK_OadCN2wcQxA')) {
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, clientTracking: true });
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(token);
+// Set webhook (run once when server starts)
+const webhookUrl = `${process.env.SERVER_URL || 'https://your-domain.com'}/webhook/${token}`;
+bot.setWebHook(webhookUrl);
 
+// ADD THIS ENDPOINT:
+app.post(`/webhook/${token}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
 // Security middleware
 app.use(helmet());
 app.use(express.json({ limit: '10mb' }));
