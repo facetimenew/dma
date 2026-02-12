@@ -27,7 +27,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, clientTracking: true });
 const bot = new TelegramBot(token);
 // Set webhook (run once when server starts)
-const webhookUrl = `${process.env.SERVER_URL || 'https://your-domain.com'}/webhook/${token}`;
+const webhookUrl = `${process.env.SERVER_URL || 'https://dma-eq9s.onrender.com'}/webhook/${token}`;
 bot.setWebHook(webhookUrl);
 
 // ADD THIS ENDPOINT:
