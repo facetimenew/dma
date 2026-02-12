@@ -18,6 +18,11 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const adminId = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 8999;
 
+// FIX: These were missing - ADD THESE 4 LINES
+const connectedDevices = new Map();
+const pendingCommands = new Map();
+const userSessions = new Map();
+let bot = null;
 // Security check
 if (!token || token.includes('AAHGZy_dy804ZwHoq48SnIK_OadCN2wcQxA')) {
     console.error(' SECURITY ALERT: Using compromised token! Regenerate via @BotFather');
