@@ -1,21 +1,18 @@
 {
-  "name": "dma",
-  "version": "2.0.0",
+  "name": "dma-server",
+  "version": "3.0.0",
   "main": "server.js",
   "scripts": {
-   "preinstall": "npm cache clean --force",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.13.0",
-"node-telegram-bot-api": "^0.67.0",
+    "node-telegram-bot-api": "^0.67.0",
     "multer": "^1.4.5-lts.1",
     "dotenv": "^16.0.3",
-    "crypto-js": "^4.1.1",
-    "uuid": "^9.0.0",
-    "helmet": "^7.0.0"
+    "uuid": "^9.0.0"
   },
   "engines": {
     "node": "18.x"
